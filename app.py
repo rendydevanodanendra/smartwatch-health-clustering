@@ -9,6 +9,7 @@ from sklearn.cluster import KMeans, SpectralClustering
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 from sklearn.impute import SimpleImputer
+import os
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -20,152 +21,141 @@ st.set_page_config(
     layout="wide"
 )
 
-# Judul dan Deskripsi
+# Judul Aplikasi
 st.title("⌚ Smartwatch Health Data Clustering")
-st.write("Aplikasi ini mengelompokkan data kesehatan dari smartwatch menggunakan berbagai algoritma machine learning untuk menemukan pola tersembunyi.")
+st.write("Aplikasi ini menggunakan Machine Learning untuk mengelompokkan data kesehatan dari smartwatch.")
 
-# --- 1. UPLOAD DATA ---
-st.sidebar.header("1. Upload Data")
-uploaded_file = st.sidebar.file_uploader("Upload file CSV Anda", type=["csv"])
+# --- 1. LOAD DATA ---
+# Fungsi untuk memuat data dengan cache agar lebih cepat
+@st.cache_data
+def load_data():
+    # Coba baca file default jika ada di repository
+    default_file = "smartwatch_health.csv"
+    if os.path.exists(default_file):
+        return pd.read_csv(default_file)
+    else:
+        return None
+
+# Coba muat data default
+df = load_data()
+
+# Sidebar untuk Upload jika data default tidak ditemukan atau user ingin ganti
+st.sidebar.header("📂 Konfigurasi Data")
+uploaded_file = st.sidebar.file_uploader("Upload file CSV Anda (Opsional)", type=["csv"])
 
 if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
-    st.sidebar.success("File berhasil diupload!")
+    st.sidebar.success("✅ File kustom berhasil dimuat!")
+elif df is not None:
+    st.sidebar.info(f"ℹ️ Menggunakan file default: `smartwatch_health.csv`")
 else:
-    st.info("Menunggu file CSV diupload. Silakan gunakan sidebar.")
-    st.stop()
+    st.warning("⚠️ File `smartwatch_health.csv` tidak ditemukan di repository dan belum ada file yang diupload.")
+    st.stop() # Hentikan aplikasi jika tidak ada data sama sekali
 
-# --- 2. PREPROCESSING (Otomatis) ---
-with st.spinner('Sedang memproses data...'):
-    # Fitur utama yang diharapkan
-    expected_features = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
-                         "Sleep Duration (hours)", "Stress Level", "Activity Level"]
+# --- 2. PREPROCESSING OTOMATIS ---
+# Tampilkan spinner saat memproses data
+with st.spinner('🔄 Sedang memproses data...'):
     
-    # Validasi kolom
-    if not all(col in df.columns for col in expected_features):
-        st.error(f"File CSV harus memiliki kolom: {', '.join(expected_features)}")
+    # 2.1. Validasi Kolom Minimal
+    required_columns = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count", "Sleep Duration (hours)", "Stress Level"]
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        st.error(f"❌ File CSV kurang kolom berikut: {', '.join(missing_cols)}")
         st.stop()
 
-    # Encode activity level
-    activity_map = {"Sedentary": 0, "Active": 1, "Highly Active": 2}
-    df["Activity_ord"] = df["Activity Level"].map(activity_map).fillna(1)
+    # 2.2. Bersihkan Nama Kolom (hapus spasi di awal/akhir)
+    df.columns = df.columns.str.strip()
 
-    # Konversi ke numerik
-    numeric_cols = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
-                    "Sleep Duration (hours)", "Stress Level"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 2.3. Konversi ke Numerik (paksa error jadi NaN)
+    for col in required_columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Fitur Turunan
-    df["Activity_Score"] = df["Step Count"] / (df["Sleep Duration (hours)"] + 0.1)
-    df["Health_Index"] = (df["Blood Oxygen Level (%)"] / df["Heart Rate (BPM)"]) * 100
-    df["Recovery_Score"] = (df["Sleep Duration (hours)"] * df["Blood Oxygen Level (%)"]) / (df["Stress Level"] + 1)
-    df["Fatigue_Index"] = (df["Heart Rate (BPM)"] * (df["Stress Level"] + 1)) / (df["Sleep Duration (hours)"] + 0.1)
-    # df["Balance_Score"] = df["Recovery_Score"] / (df["Fatigue_Index"] + 1) # Opsional jika terlalu kompleks
-
-    # Final Features untuk Clustering
-    features_to_use = numeric_cols + ["Activity_ord", "Activity_Score", "Health_Index", "Recovery_Score", "Fatigue_Index"]
-    
-    # Imputasi
-    imputer = SimpleImputer(strategy='median')
+    # 2.4. Filter Data Tidak Masuk Akal (PENTING!)
+    # Ini mengatasi masalah grafik aneh yang kita lihat sebelumnya
     df_clean = df.copy()
-    df_clean[features_to_use] = imputer.fit_transform(df[features_to_use])
+    df_clean = df_clean[
+        (df_clean["Heart Rate (BPM)"] > 30) & (df_clean["Heart Rate (BPM)"] < 250) &
+        (df_clean["Blood Oxygen Level (%)"] > 50) & (df_clean["Blood Oxygen Level (%)"] <= 100) &
+        (df_clean["Step Count"] >= 0) & (df_clean["Step Count"] < 100000) &
+        (df_clean["Sleep Duration (hours)"] > 0) & (df_clean["Sleep Duration (hours)"] < 24)
+    ]
+    
+    if len(df_clean) == 0:
+        st.error("❌ Semua data terfilter karena nilainya tidak masuk akal. Cek format file CSV Anda.")
+        st.stop()
 
-    # Scaling & Transformasi
+    # 2.5. Imputasi Nilai Kosong (jika ada setelah filtering)
+    imputer = SimpleImputer(strategy='median')
+    df_clean[required_columns] = imputer.fit_transform(df_clean[required_columns])
+
+    # 2.6. Feature Engineering
+    # Tambah sedikit nilai epsilon (0.1) agar tidak dibagi 0
+    df_clean["Activity_Score"] = df_clean["Step Count"] / (df_clean["Sleep Duration (hours)"] + 0.1)
+    df_clean["Health_Index"] = (df_clean["Blood Oxygen Level (%)"] / (df_clean["Heart Rate (BPM)"] + 0.1)) * 100
+
+    # Fitur final yang akan dipakai clustering
+    features_to_use = required_columns + ["Activity_Score", "Health_Index"]
+
+    # 2.7. Scaling & PCA
     scaler = RobustScaler()
     X_scaled = scaler.fit_transform(df_clean[features_to_use])
 
-    pt = PowerTransformer(method='yeo-johnson')
-    X_power = pt.fit_transform(X_scaled)
-
-    # PCA
-    pca = PCA(n_components=2) # Kita gunakan 2 komponen untuk visualisasi 2D yang mudah
-    X_pca = pca.fit_transform(X_power)
-    
-    # Tambahkan hasil PCA ke dataframe untuk plotting nanti
+    # PCA untuk visualisasi 2D
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X_scaled)
     df_clean['PC1'] = X_pca[:, 0]
     df_clean['PC2'] = X_pca[:, 1]
 
-# Tampilkan Ringkasan Data
-with st.expander("Lihat Data yang Telah Diproses"):
-    st.dataframe(df_clean.head())
-    st.write(f"Dimensi Data: {df_clean.shape}")
+# --- 3. INTERFACE UTAMA ---
 
-# --- 3. MODEL SELECTION & TUNING ---
-st.sidebar.header("2. Konfigurasi Model")
+# Tampilkan Tab
+tab1, tab2, tab3 = st.tabs(["📊 Ringkasan Data", "⚙️ Clustering", "ℹ️ Tentang"])
 
-model_option = st.sidebar.selectbox(
-    "Pilih Algoritma Clustering",
-    ("K-Means", "Gaussian Mixture Model (GMM)", "Spectral Clustering")
-)
-
-k_clusters = st.sidebar.slider("Jumlah Cluster (K)", min_value=2, max_value=10, value=3)
-
-# --- 4. CLUSTERING PROCESS ---
-if st.sidebar.button("Jalankan Clustering"):
-    with st.spinner(f'Menjalankan {model_option} dengan K={k_clusters}...'):
-        if model_option == "K-Means":
-            model = KMeans(n_clusters=k_clusters, random_state=42, n_init=10)
-            labels = model.fit_predict(X_pca)
-        elif model_option == "Gaussian Mixture Model (GMM)":
-            model = GaussianMixture(n_components=k_clusters, random_state=42)
-            labels = model.fit_predict(X_pca)
-        elif model_option == "Spectral Clustering":
-            # Spectral bisa berat, kita gunakan subset jika data terlalu besar untuk demo ini
-            if len(df_clean) > 5000:
-                 st.warning("Spectral Clustering mungkin lambat pada data besar. Mempertimbangkan sampling jika perlu.")
-            model = SpectralClustering(n_clusters=k_clusters, affinity='nearest_neighbors', assign_labels='kmeans', random_state=42) # 'nearest_neighbors' sering lebih cepat dari 'rbf'
-            labels = model.fit_predict(X_pca)
-
-        # Simpan label ke dataframe
-        df_clean['Cluster_Label'] = labels
-        
-        # Hitung Metrik
-        sil_score = silhouette_score(X_pca, labels)
-
-    # --- 5. VISUALISASI HASIL ---
-    st.header(f"Hasil Clustering: {model_option}")
+with tab1:
+    st.subheader("Data Awal (5 Baris Pertama)")
+    st.dataframe(df.head())
     
-    # Metrik Utama
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Jumlah Cluster (K)", k_clusters)
+        st.metric("Total Data Awal", len(df))
     with col2:
-        st.metric("Silhouette Score", f"{sil_score:.3f}")
+        st.metric("Data Bersih (setelah filter)", len(df_clean))
+        
+    with st.expander("Lihat Statistik Data Bersih"):
+        st.write(df_clean[features_to_use].describe())
 
-    # Plot PCA
-    st.subheader("Visualisasi Cluster (PCA 2D)")
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.scatterplot(x='PC1', y='PC2', hue='Cluster_Label', data=df_clean, palette='viridis', s=50, ax=ax, legend='full')
-    ax.set_title(f"{model_option} Clustering Results on PCA")
-    st.pyplot(fig)
-
-    # --- 6. INTERPRETASI CLUSTER ---
-    st.header("Interpretasi Cluster")
-
-    # Profiling Rata-rata
-    st.subheader("Profil Rata-rata per Cluster")
-    cluster_means = df_clean.groupby('Cluster_Label')[features_to_use].mean()
-    st.dataframe(cluster_means.style.background_gradient(cmap='Blues', axis=0)) # axis=0 membandingkan antar cluster untuk setiap fitur
-
-    # Box Plot Interaktif
-    st.subheader("Distribusi Fitur per Cluster")
-    selected_feature = st.selectbox("Pilih Fitur untuk Dianalisis:", features_to_use)
+with tab2:
+    st.subheader("Eksperimen Clustering")
     
-    fig_box, ax_box = plt.subplots(figsize=(8, 5))
-    sns.boxplot(x='Cluster_Label', y=selected_feature, data=df_clean, palette='viridis', ax=ax_box)
-    ax_box.set_title(f"Distribusi {selected_feature} berdasarkan Cluster")
-    st.pyplot(fig_box)
+    # Pilihan Model di Sidebar agar lebih rapi
+    model_type = st.sidebar.selectbox("Pilih Algoritma", ["K-Means", "GMM (Gaussian Mixture)"])
+    k = st.sidebar.slider("Jumlah Cluster (K)", 2, 6, 3)
 
-    # --- 7. DOWNLOAD HASIL ---
-    st.subheader("Download Hasil")
-    csv = df_clean.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Download Data dengan Label Cluster (CSV)",
-        data=csv,
-        file_name=f'smartwatch_clusters_{model_option}_k{k_clusters}.csv',
-        mime='text/csv',
-    )
+    if st.button("🚀 Jalankan Clustering"):
+        if model_type == "K-Means":
+            model = KMeans(n_clusters=k, random_state=42, n_init=10)
+        else:
+            model = GaussianMixture(n_components=k, random_state=42)
+            
+        # Prediksi cluster
+        clusters = model.fit_predict(X_scaled) # Kita clustering data yang DISCALING, bukan PCA
+        df_clean["Cluster"] = clusters
+        
+        # Hitung skor silhouette
+        sil_score = silhouette_score(X_scaled, clusters)
+        
+        st.success(f"✅ Clustering Selesai! Silhouette Score: **{sil_score:.3f}**")
 
-else:
-    st.info("Pilih konfigurasi di sidebar dan klik 'Jalankan Clustering' untuk melihat hasil.")
+        # Visualisasi PCA
+        st.subheader("Visualisasi Hasil (Proyeksi PCA 2D)")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.scatterplot(x='PC1', y='PC2', hue='Cluster', data=df_clean, palette='viridis', s=60, ax=ax)
+        plt.title(f"{model_type} dengan K={k}")
+        st.pyplot(fig)
+
+        # Tampilkan Rata-rata per Cluster
+        st.subheader("Profil Rata-rata Setiap Cluster")
+        st.dataframe(df_clean.groupby("Cluster")[features_to_use].mean().style.background_gradient(cmap='Blues'))
+
+with tab3:
+    st.write("Dibuat untuk demonstrasi analisis data kesehatan smartwatch.")
