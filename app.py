@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import RobustScaler, PowerTransformer
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, SpectralClustering
@@ -9,139 +10,162 @@ from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 from sklearn.impute import SimpleImputer
 import warnings
+
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Smartwatch Health Clustering", layout="wide")
+# Konfigurasi Halaman Streamlit
+st.set_page_config(
+    page_title="Smartwatch Health Clustering",
+    page_icon="⌚",
+    layout="wide"
+)
 
-st.title("⌚ Smartwatch Health Clustering Dashboard")
-st.markdown("### 📊 Analisis Kesehatan Pengguna Berdasarkan Data Smartwatch")
+# Judul dan Deskripsi
+st.title("⌚ Smartwatch Health Data Clustering")
+st.write("Aplikasi ini mengelompokkan data kesehatan dari smartwatch menggunakan berbagai algoritma machine learning untuk menemukan pola tersembunyi.")
 
-# =============================================
-# UPLOAD DATA
-# =============================================
-uploaded_file = st.file_uploader("📂 Upload file CSV data smartwatch", type=["csv"])
+# --- 1. UPLOAD DATA ---
+st.sidebar.header("1. Upload Data")
+uploaded_file = st.sidebar.file_uploader("Upload file CSV Anda", type=["csv"])
 
-if uploaded_file:
+if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
+    st.sidebar.success("File berhasil diupload!")
+else:
+    st.info("Menunggu file CSV diupload. Silakan gunakan sidebar.")
+    st.stop()
 
-    # 1️⃣ Fitur utama
-    features = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
-                "Sleep Duration (hours)", "Stress Level"]
+# --- 2. PREPROCESSING (Otomatis) ---
+with st.spinner('Sedang memproses data...'):
+    # Fitur utama yang diharapkan
+    expected_features = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
+                         "Sleep Duration (hours)", "Stress Level", "Activity Level"]
+    
+    # Validasi kolom
+    if not all(col in df.columns for col in expected_features):
+        st.error(f"File CSV harus memiliki kolom: {', '.join(expected_features)}")
+        st.stop()
 
-    # 2️⃣ Encode activity level
+    # Encode activity level
     activity_map = {"Sedentary": 0, "Active": 1, "Highly Active": 2}
     df["Activity_ord"] = df["Activity Level"].map(activity_map).fillna(1)
-    features.append("Activity_ord")
 
-    # 3️⃣ Pastikan numerik
-    df[features] = df[features].apply(pd.to_numeric, errors="coerce")
+    # Konversi ke numerik
+    numeric_cols = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
+                    "Sleep Duration (hours)", "Stress Level"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Fitur Turunan
+    df["Activity_Score"] = df["Step Count"] / (df["Sleep Duration (hours)"] + 0.1)
+    df["Health_Index"] = (df["Blood Oxygen Level (%)"] / df["Heart Rate (BPM)"]) * 100
+    df["Recovery_Score"] = (df["Sleep Duration (hours)"] * df["Blood Oxygen Level (%)"]) / (df["Stress Level"] + 1)
+    df["Fatigue_Index"] = (df["Heart Rate (BPM)"] * (df["Stress Level"] + 1)) / (df["Sleep Duration (hours)"] + 0.1)
+    # df["Balance_Score"] = df["Recovery_Score"] / (df["Fatigue_Index"] + 1) # Opsional jika terlalu kompleks
+
+    # Final Features untuk Clustering
+    features_to_use = numeric_cols + ["Activity_ord", "Activity_Score", "Health_Index", "Recovery_Score", "Fatigue_Index"]
+    
+    # Imputasi
     imputer = SimpleImputer(strategy='median')
-    df[features] = imputer.fit_transform(df[features])
+    df_clean = df.copy()
+    df_clean[features_to_use] = imputer.fit_transform(df[features_to_use])
 
-    # 4️⃣ Transformasi
+    # Scaling & Transformasi
     scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(df[features])
+    X_scaled = scaler.fit_transform(df_clean[features_to_use])
+
     pt = PowerTransformer(method='yeo-johnson')
     X_power = pt.fit_transform(X_scaled)
-    X_log = np.log1p(np.abs(X_power))
-    X_log = np.nan_to_num(X_log, nan=0.0)
 
     # PCA
-    pca = PCA(n_components=3, random_state=42)
-    X_pca = pca.fit_transform(X_log)
+    pca = PCA(n_components=2) # Kita gunakan 2 komponen untuk visualisasi 2D yang mudah
+    X_pca = pca.fit_transform(X_power)
+    
+    # Tambahkan hasil PCA ke dataframe untuk plotting nanti
+    df_clean['PC1'] = X_pca[:, 0]
+    df_clean['PC2'] = X_pca[:, 1]
 
-    # =============================================
-    # CLUSTERING
-    # =============================================
-    models = {
-        "KMeans+PCA": KMeans,
-        "Spectral": SpectralClustering,
-        "GMM": GaussianMixture
-    }
+# Tampilkan Ringkasan Data
+with st.expander("Lihat Data yang Telah Diproses"):
+    st.dataframe(df_clean.head())
+    st.write(f"Dimensi Data: {df_clean.shape}")
 
-    results = []
-    for model_name, model_class in models.items():
-        sil_scores = {}
-        for k in range(2, 10):
-            if model_name == "KMeans+PCA":
-                model = model_class(n_clusters=k, random_state=42, n_init=20)
-                labels = model.fit_predict(X_pca)
-            elif model_name == "GMM":
-                model = model_class(n_components=k, random_state=42)
-                labels = model.fit_predict(X_pca)
-            else:  # Spectral
-                model = model_class(n_clusters=k, affinity='rbf', assign_labels='kmeans', random_state=42)
-                labels = model.fit_predict(X_pca)
-            sil = silhouette_score(X_pca, labels)
-            sil_scores[k] = sil
+# --- 3. MODEL SELECTION & TUNING ---
+st.sidebar.header("2. Konfigurasi Model")
 
-        best_k = max(sil_scores, key=sil_scores.get)
-        results.append({
-            "Model": model_name,
-            "Best K": best_k,
-            "Silhouette": sil_scores[best_k]
-        })
+model_option = st.sidebar.selectbox(
+    "Pilih Algoritma Clustering",
+    ("K-Means", "Gaussian Mixture Model (GMM)", "Spectral Clustering")
+)
 
-    # =============================================
-    # HASIL
-    # =============================================
-    st.subheader("📈 Hasil Evaluasi Model")
-    results_df = pd.DataFrame(results).sort_values(by="Silhouette", ascending=False)
-    st.dataframe(results_df, use_container_width=True)
+k_clusters = st.sidebar.slider("Jumlah Cluster (K)", min_value=2, max_value=10, value=3)
 
-    best_model = results_df.iloc[0]
-    st.success(f"🔥 Model terbaik: **{best_model['Model']} (K={best_model['Best K']})** "
-               f"dengan Silhouette = **{best_model['Silhouette']:.3f}**")
+# --- 4. CLUSTERING PROCESS ---
+if st.sidebar.button("Jalankan Clustering"):
+    with st.spinner(f'Menjalankan {model_option} dengan K={k_clusters}...'):
+        if model_option == "K-Means":
+            model = KMeans(n_clusters=k_clusters, random_state=42, n_init=10)
+            labels = model.fit_predict(X_pca)
+        elif model_option == "Gaussian Mixture Model (GMM)":
+            model = GaussianMixture(n_components=k_clusters, random_state=42)
+            labels = model.fit_predict(X_pca)
+        elif model_option == "Spectral Clustering":
+            # Spectral bisa berat, kita gunakan subset jika data terlalu besar untuk demo ini
+            if len(df_clean) > 5000:
+                 st.warning("Spectral Clustering mungkin lambat pada data besar. Mempertimbangkan sampling jika perlu.")
+            model = SpectralClustering(n_clusters=k_clusters, affinity='nearest_neighbors', assign_labels='kmeans', random_state=42) # 'nearest_neighbors' sering lebih cepat dari 'rbf'
+            labels = model.fit_predict(X_pca)
 
-    # =============================================
-    # VISUALISASI CLUSTER
-    # =============================================
-    if best_model['Model'] == "KMeans+PCA":
-        best_model_fit = KMeans(n_clusters=int(best_model["Best K"]), random_state=42, n_init=20).fit(X_pca)
-        labels = best_model_fit.labels_
-    elif best_model['Model'] == "GMM":
-        best_model_fit = GaussianMixture(n_components=int(best_model["Best K"]), random_state=42).fit(X_pca)
-        labels = best_model_fit.predict(X_pca)
-    else:
-        best_model_fit = SpectralClustering(n_clusters=int(best_model["Best K"]),
-                                            affinity='rbf', assign_labels='kmeans', random_state=42)
-        labels = best_model_fit.fit_predict(X_pca)
+        # Simpan label ke dataframe
+        df_clean['Cluster_Label'] = labels
+        
+        # Hitung Metrik
+        sil_score = silhouette_score(X_pca, labels)
 
-    df["Cluster"] = labels
+    # --- 5. VISUALISASI HASIL ---
+    st.header(f"Hasil Clustering: {model_option}")
+    
+    # Metrik Utama
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Jumlah Cluster (K)", k_clusters)
+    with col2:
+        st.metric("Silhouette Score", f"{sil_score:.3f}")
 
-    st.subheader("🎯 Visualisasi Cluster")
-    fig, ax = plt.subplots(figsize=(8,6))
-    scatter = ax.scatter(X_pca[:,0], X_pca[:,1], c=labels, cmap="rainbow", s=15)
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
-    ax.set_title(f"{best_model['Model']} (K={best_model['Best K']}) — Silhouette={best_model['Silhouette']:.3f}")
+    # Plot PCA
+    st.subheader("Visualisasi Cluster (PCA 2D)")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.scatterplot(x='PC1', y='PC2', hue='Cluster_Label', data=df_clean, palette='viridis', s=50, ax=ax, legend='full')
+    ax.set_title(f"{model_option} Clustering Results on PCA")
     st.pyplot(fig)
 
-    # =============================================
-    # INSIGHT OTOMATIS
-    # =============================================
-    st.subheader("🧠 Insight Otomatis per Cluster")
-    summary = df.groupby("Cluster")[features].mean().round(2)
-    st.dataframe(summary, use_container_width=True)
+    # --- 6. INTERPRETASI CLUSTER ---
+    st.header("Interpretasi Cluster")
 
-    st.markdown("### 💬 Interpretasi Sederhana")
-    for i, row in summary.iterrows():
-        desc = []
-        if row["Step Count"] > summary["Step Count"].mean():
-            desc.append("aktif")
-        else:
-            desc.append("kurang aktif")
-        if row["Sleep Duration (hours)"] < summary["Sleep Duration (hours)"].mean():
-            desc.append("kurang tidur")
-        if row["Stress Level"] > summary["Stress Level"].mean():
-            desc.append("stres tinggi")
-        else:
-            desc.append("relatif tenang")
+    # Profiling Rata-rata
+    st.subheader("Profil Rata-rata per Cluster")
+    cluster_means = df_clean.groupby('Cluster_Label')[features_to_use].mean()
+    st.dataframe(cluster_means.style.background_gradient(cmap='Blues', axis=0)) # axis=0 membandingkan antar cluster untuk setiap fitur
 
-        st.write(f"- Cluster **{i}** → HR={row['Heart Rate (BPM)']:.1f}, BO={row['Blood Oxygen Level (%)']:.1f}, "
-                 f"Step={row['Step Count']:.0f} → {' & '.join(desc)}")
+    # Box Plot Interaktif
+    st.subheader("Distribusi Fitur per Cluster")
+    selected_feature = st.selectbox("Pilih Fitur untuk Dianalisis:", features_to_use)
+    
+    fig_box, ax_box = plt.subplots(figsize=(8, 5))
+    sns.boxplot(x='Cluster_Label', y=selected_feature, data=df_clean, palette='viridis', ax=ax_box)
+    ax_box.set_title(f"Distribusi {selected_feature} berdasarkan Cluster")
+    st.pyplot(fig_box)
 
-    # =============================================
-    # EXPORT HASIL
-    # =============================================
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("💾 Download hasil clustering (CSV)", csv, "smartwatch_cluster_result.csv", "text/csv")
+    # --- 7. DOWNLOAD HASIL ---
+    st.subheader("Download Hasil")
+    csv = df_clean.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download Data dengan Label Cluster (CSV)",
+        data=csv,
+        file_name=f'smartwatch_clusters_{model_option}_k{k_clusters}.csv',
+        mime='text/csv',
+    )
+
+else:
+    st.info("Pilih konfigurasi di sidebar dan klik 'Jalankan Clustering' untuk melihat hasil.")
