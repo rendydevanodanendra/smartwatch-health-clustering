@@ -14,148 +14,280 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Konfigurasi Halaman Streamlit
+# --- KONFIGURASI HALAMAN STREAMLIT ---
 st.set_page_config(
-    page_title="Smartwatch Health Clustering",
+    page_title="Smartwatch Health Clustering V6",
     page_icon="⌚",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Judul Aplikasi
-st.title("⌚ Smartwatch Health Data Clustering")
-st.write("Aplikasi ini menggunakan Machine Learning untuk mengelompokkan data kesehatan dari smartwatch.")
+# --- JUDUL APLIKASI ---
+st.title("⌚ Smartwatch Health Data Clustering (Final V6)")
+st.markdown("""
+Aplikasi ini melakukan analisis clustering pada data kesehatan smartwatch untuk menemukan pola tersembunyi.
+Menggunakan perbandingan multi-model (K-Means, GMM, Spectral Clustering) dengan preprocessing tingkat lanjut.
+""")
 
-# --- 1. LOAD DATA ---
-# Fungsi untuk memuat data dengan cache agar lebih cepat
+# --- 1. LOAD & PREPROCESSING DATA (Di-cache agar cepat) ---
 @st.cache_data
-def load_data():
-    # Coba baca file default jika ada di repository
-    default_file = "smartwatch_health.csv"
-    if os.path.exists(default_file):
-        return pd.read_csv(default_file)
+def load_and_preprocess_data(uploaded_file=None):
+    # 1. Load Data
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
     else:
-        return None
+        default_file = "smartwatch_health.csv"
+        if os.path.exists(default_file):
+            df = pd.read_csv(default_file)
+        else:
+            # Jika tidak ada file sama sekali, return None
+            return None, None, None, None, None
 
-# Coba muat data default
-df = load_data()
+    # 2. Definisi Fitur Awal
+    features = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count",
+                "Sleep Duration (hours)", "Stress Level"]
 
-# Sidebar untuk Upload jika data default tidak ditemukan atau user ingin ganti
-st.sidebar.header("📂 Konfigurasi Data")
-uploaded_file = st.sidebar.file_uploader("Upload file CSV Anda (Opsional)", type=["csv"])
+    # 3. Encode Activity Level
+    # Cek apakah kolom ada, untuk menghindari error jika nama kolom beda
+    if "Activity Level" in df.columns:
+        activity_map = {"Sedentary": 0, "Active": 1, "Highly Active": 2}
+        df["Activity_ord"] = df["Activity Level"].map(activity_map).fillna(1)
+        features.append("Activity_ord")
+    elif "Activity_ord" in df.columns: # Jika sudah ter-encode di CSV
+         features.append("Activity_ord")
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.sidebar.success("✅ File kustom berhasil dimuat!")
-elif df is not None:
-    st.sidebar.info(f"ℹ️ Menggunakan file default: `smartwatch_health.csv`")
-else:
-    st.warning("⚠️ File `smartwatch_health.csv` tidak ditemukan di repository dan belum ada file yang diupload.")
-    st.stop() # Hentikan aplikasi jika tidak ada data sama sekali
+    # 4. Konversi ke Numerik (PENTING: Lakukan sebelum fitur turunan)
+    for col in features:
+        # Membersihkan karakter non-numerik jika ada (opsional tapi bagus untuk jaga-jaga)
+        if col in df.columns and df[col].dtype == 'object':
+             df[col] = df[col].astype(str).str.replace(r'[^\d\.]', '', regex=True)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# --- 2. PREPROCESSING OTOMATIS ---
-# Tampilkan spinner saat memproses data
-with st.spinner('🔄 Sedang memproses data...'):
-    
-    # 2.1. Validasi Kolom Minimal
-    required_columns = ["Heart Rate (BPM)", "Blood Oxygen Level (%)", "Step Count", "Sleep Duration (hours)", "Stress Level"]
-    missing_cols = [col for col in required_columns if col not in df.columns]
-    if missing_cols:
-        st.error(f"❌ File CSV kurang kolom berikut: {', '.join(missing_cols)}")
-        st.stop()
-
-    # 2.2. Bersihkan Nama Kolom (hapus spasi di awal/akhir)
-    df.columns = df.columns.str.strip()
-
-    # 2.3. Konversi ke Numerik (paksa error jadi NaN)
-    for col in required_columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    # 2.4. Filter Data Tidak Masuk Akal (PENTING!)
-    # Ini mengatasi masalah grafik aneh yang kita lihat sebelumnya
-    df_clean = df.copy()
-    df_clean = df_clean[
-        (df_clean["Heart Rate (BPM)"] > 30) & (df_clean["Heart Rate (BPM)"] < 250) &
-        (df_clean["Blood Oxygen Level (%)"] > 50) & (df_clean["Blood Oxygen Level (%)"] <= 100) &
-        (df_clean["Step Count"] >= 0) & (df_clean["Step Count"] < 100000) &
-        (df_clean["Sleep Duration (hours)"] > 0) & (df_clean["Sleep Duration (hours)"] < 24)
-    ]
-    
-    if len(df_clean) == 0:
-        st.error("❌ Semua data terfilter karena nilainya tidak masuk akal. Cek format file CSV Anda.")
-        st.stop()
-
-    # 2.5. Imputasi Nilai Kosong (jika ada setelah filtering)
+    # 5. Imputasi Awal (untuk fitur dasar sebelum fitur turunan)
     imputer = SimpleImputer(strategy='median')
-    df_clean[required_columns] = imputer.fit_transform(df_clean[required_columns])
+    # Hanya imputasi kolom yang ada
+    valid_features = [f for f in features if f in df.columns]
+    df[valid_features] = imputer.fit_transform(df[valid_features])
 
-    # 2.6. Feature Engineering
-    # Tambah sedikit nilai epsilon (0.1) agar tidak dibagi 0
-    df_clean["Activity_Score"] = df_clean["Step Count"] / (df_clean["Sleep Duration (hours)"] + 0.1)
-    df_clean["Health_Index"] = (df_clean["Blood Oxygen Level (%)"] / (df_clean["Heart Rate (BPM)"] + 0.1)) * 100
+    # 6. Fitur Turunan (Feature Engineering)
+    # Menambahkan konstanta kecil (1e-9) untuk menghindari pembagian dengan nol
+    # Pastikan kolom yang dibutuhkan ada sebelum menghitung
+    if all(col in df.columns for col in ["Step Count", "Sleep Duration (hours)", "Blood Oxygen Level (%)", "Heart Rate (BPM)", "Stress Level"]):
+        df["Activity_Score"] = df["Step Count"] / (df["Sleep Duration (hours)"] + 0.1)
+        df["Health_Index"] = (df["Blood Oxygen Level (%)"] / (df["Heart Rate (BPM)"] + 1e-9)) * 100
+        df["Recovery_Score"] = (df["Sleep Duration (hours)"] * df["Blood Oxygen Level (%)"]) / (df["Stress Level"] + 1)
+        df["Fatigue_Index"] = (df["Heart Rate (BPM)"] * (df["Stress Level"] + 1)) / (df["Sleep Duration (hours)"] + 0.1)
+        df["Balance_Score"] = df["Recovery_Score"] / (df["Fatigue_Index"] + 1)
 
-    # Fitur final yang akan dipakai clustering
-    features_to_use = required_columns + ["Activity_Score", "Health_Index"]
+        # Update daftar fitur yang akan digunakan untuk clustering
+        final_features = valid_features + ["Activity_Score", "Health_Index", "Recovery_Score", "Fatigue_Index", "Balance_Score"]
+    else:
+        final_features = valid_features
+        st.warning("Beberapa kolom untuk fitur turunan tidak ditemukan. Menggunakan fitur dasar saja.")
 
-    # 2.7. Scaling & PCA
+    # Bersihkan NaN/Inf yang mungkin muncul dari fitur turunan
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df[final_features] = imputer.fit_transform(df[final_features])
+
+    # 7. Scaling & Transformasi
     scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(df_clean[features_to_use])
+    X_scaled = scaler.fit_transform(df[final_features])
 
-    # PCA untuk visualisasi 2D
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(X_scaled)
-    df_clean['PC1'] = X_pca[:, 0]
-    df_clean['PC2'] = X_pca[:, 1]
+    # PowerTransformer kadang gagal jika data terlalu sedikit atau konstan
+    try:
+        pt = PowerTransformer(method='yeo-johnson')
+        X_power = pt.fit_transform(X_scaled)
+    except Exception as e:
+        st.warning(f"PowerTransformer gagal, menggunakan data terskala RobustScaler: {e}")
+        X_power = X_scaled
 
-# --- 3. INTERFACE UTAMA ---
+    X_for_pca = X_power
 
-# Tampilkan Tab
-tab1, tab2, tab3 = st.tabs(["📊 Ringkasan Data", "⚙️ Clustering", "ℹ️ Tentang"])
+    # 8. PCA
+    pca = PCA(n_components=2) # Gunakan 2 komponen untuk visualisasi mudah
+    X_pca = pca.fit_transform(X_for_pca)
+    df['PC1'] = X_pca[:, 0]
+    df['PC2'] = X_pca[:, 1]
 
+    return df, final_features, X_scaled, X_power, X_pca
+
+# --- SIDEBAR: UPLOAD DATA ---
+st.sidebar.header("📁 Upload Data")
+uploaded_file = st.sidebar.file_uploader("Upload file CSV Anda (opsional)", type=["csv"])
+
+# --- LOAD DATA ---
+with st.spinner("🔄 Memuat dan memproses data..."):
+    df, features, X_scaled, X_power, X_pca = load_and_preprocess_data(uploaded_file)
+
+if df is None:
+    st.warning("⚠️ File `smartwatch_health.csv` tidak ditemukan di repository dan Anda belum mengupload file. Silakan upload file CSV di sidebar.")
+    st.stop()
+
+st.sidebar.success("✅ Data berhasil dimuat & diproses!")
+with st.sidebar.expander("ℹ️ Info Data"):
+    st.write(f"Jumlah Baris: {df.shape[0]}")
+    st.write(f"Jumlah Fitur: {len(features)}")
+
+# --- TABS UTAMA ---
+tab1, tab2, tab3 = st.tabs(["📊 Ringkasan Data", "⚙️ Eksperimen Clustering", "💡 Interpretasi & Download"])
+
+# --- TAB 1: RINGKASAN DATA ---
 with tab1:
-    st.subheader("Data Awal (5 Baris Pertama)")
+    st.subheader("Data Setelah Preprocessing (5 Baris Pertama)")
     st.dataframe(df.head())
-    
+
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Total Data Awal", len(df))
+        st.subheader("Statistik Deskriptif")
+        st.dataframe(df[features].describe())
     with col2:
-        st.metric("Data Bersih (setelah filter)", len(df_clean))
-        
-    with st.expander("Lihat Statistik Data Bersih"):
-        st.write(df_clean[features_to_use].describe())
-
-with tab2:
-    st.subheader("Eksperimen Clustering")
-    
-    # Pilihan Model di Sidebar agar lebih rapi
-    model_type = st.sidebar.selectbox("Pilih Algoritma", ["K-Means", "GMM (Gaussian Mixture)"])
-    k = st.sidebar.slider("Jumlah Cluster (K)", 2, 6, 3)
-
-    if st.button("🚀 Jalankan Clustering"):
-        if model_type == "K-Means":
-            model = KMeans(n_clusters=k, random_state=42, n_init=10)
-        else:
-            model = GaussianMixture(n_components=k, random_state=42)
-            
-        # Prediksi cluster
-        clusters = model.fit_predict(X_scaled) # Kita clustering data yang DISCALING, bukan PCA
-        df_clean["Cluster"] = clusters
-        
-        # Hitung skor silhouette
-        sil_score = silhouette_score(X_scaled, clusters)
-        
-        st.success(f"✅ Clustering Selesai! Silhouette Score: **{sil_score:.3f}**")
-
-        # Visualisasi PCA
-        st.subheader("Visualisasi Hasil (Proyeksi PCA 2D)")
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.scatterplot(x='PC1', y='PC2', hue='Cluster', data=df_clean, palette='viridis', s=60, ax=ax)
-        plt.title(f"{model_type} dengan K={k}")
+        st.subheader("Korelasi Fitur")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(df[features].corr(), annot=False, cmap='coolwarm', ax=ax)
         st.pyplot(fig)
 
-        # Tampilkan Rata-rata per Cluster
-        st.subheader("Profil Rata-rata Setiap Cluster")
-        st.dataframe(df_clean.groupby("Cluster")[features_to_use].mean().style.background_gradient(cmap='Blues'))
+# --- TAB 2: EKSPERIMEN CLUSTERING ---
+with tab2:
+    st.header("🛠️ Konfigurasi & Eksperimen")
 
+    # Pilihan Model & Parameter
+    col_model, col_k = st.columns(2)
+    with col_model:
+        model_name = st.selectbox("Pilih Algoritma Model", ["K-Means (PCA)", "K-Means (Raw Scaled)", "GMM (PCA)", "Spectral Clustering (PCA)"])
+    with col_k:
+        k_range = st.slider("Rentang Jumlah Cluster (K) untuk Eksperimen", 2, 10, (2, 6))
+
+    # Tombol Jalankan
+    if st.button("🚀 Jalankan Eksperimen Otomatis"):
+        results = []
+        best_score = -1
+        best_k = -1
+        best_labels = None
+        best_model_type = ""
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        # Loop eksperimen K
+        k_values = range(k_range[0], k_range[1] + 1)
+        total_steps = len(k_values)
+
+        for i, k in enumerate(k_values):
+            status_text.text(f"⏳ Sedang menjalankan K={k}...")
+            
+            # Pilih data input berdasarkan model
+            if "PCA" in model_name:
+                X_input = X_pca
+            else: # Raw Scaled
+                X_input = X_power # Menggunakan hasil PowerTransformer sebagai "Raw Scaled" yang lebih baik
+
+            # Jalankan Model
+            if "K-Means" in model_name:
+                model = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = model.fit_predict(X_input)
+            elif "GMM" in model_name:
+                model = GaussianMixture(n_components=k, random_state=42)
+                labels = model.fit_predict(X_input)
+            elif "Spectral" in model_name:
+                # Peringatan untuk data besar
+                if len(df) > 2000:
+                     labels = np.zeros(len(df)) # Placeholder agar tidak crash, idealnya sampling
+                     st.warning(f"Spectral Clustering terlalu lambat untuk {len(df)} data. Hasil K={k} dilewati.")
+                     sil = -1
+                else:
+                    model = SpectralClustering(n_clusters=k, affinity='nearest_neighbors', assign_labels='kmeans', random_state=42)
+                    labels = model.fit_predict(X_input)
+            
+            # Hitung Silhouette Score (jika berhasil)
+            if "Spectral" not in model_name or len(df) <= 2000:
+                sil = silhouette_score(X_input, labels)
+                results.append({"K": k, "Silhouette Score": sil})
+
+                if sil > best_score:
+                    best_score = sil
+                    best_k = k
+                    best_labels = labels
+                    best_model_type = model_name
+
+            progress_bar.progress((i + 1) / total_steps)
+
+        progress_bar.empty()
+        status_text.text("✅ Eksperimen Selesai!")
+
+        # Simpan hasil terbaik ke session state agar tidak hilang saat refresh
+        st.session_state['best_labels'] = best_labels
+        st.session_state['best_k'] = best_k
+        st.session_state['best_score'] = best_score
+        st.session_state['best_model'] = best_model_type
+        st.session_state['results_df'] = pd.DataFrame(results)
+
+    # Tampilkan Hasil Eksperimen jika sudah ada di session state
+    if 'results_df' in st.session_state:
+        st.subheader("📈 Hasil Eksperimen")
+        
+        col_res1, col_res2 = st.columns([1, 2])
+        with col_res1:
+            # Highlight nilai maksimum di kolom Silhouette Score
+            st.dataframe(st.session_state['results_df'].style.highlight_max(axis=0, color='lightgreen', subset=['Silhouette Score']))
+            st.success(f"🏆 K Terbaik: **{st.session_state['best_k']}** (Score: {st.session_state['best_score']:.3f})")
+        
+        with col_res2:
+            # Line chart untuk elbow method/silhouette analysis
+            fig_line, ax_line = plt.subplots()
+            sns.lineplot(data=st.session_state['results_df'], x="K", y="Silhouette Score", marker="o", ax=ax_line)
+            ax_line.set_title("Silhouette Score vs Jumlah Cluster (K)")
+            ax_line.set_xlabel("Jumlah Cluster (K)")
+            ax_line.set_ylabel("Silhouette Score")
+            ax_line.axvline(x=st.session_state['best_k'], color='r', linestyle='--', label=f'Best K={st.session_state["best_k"]}')
+            ax_line.legend()
+            st.pyplot(fig_line)
+
+        # Visualisasi Cluster Terbaik
+        st.subheader(f"Visualisasi Cluster Terbaik (K={st.session_state['best_k']})")
+        
+        # PENTING: Pastikan panjang labels sama dengan df sebelum assign
+        if len(st.session_state['best_labels']) == len(df):
+            df['Cluster'] = st.session_state['best_labels'] # Simpan label ke dataframe utama
+
+            fig_scatter, ax_scatter = plt.subplots(figsize=(10, 6))
+            # Gunakan palette yang jelas untuk kategori
+            sns.scatterplot(x='PC1', y='PC2', hue='Cluster', data=df, palette='bright', s=60, ax=ax_scatter, legend='full')
+            ax_scatter.set_title(f"Proyeksi PCA - {st.session_state['best_model']} (K={st.session_state['best_k']})")
+            st.pyplot(fig_scatter)
+        else:
+            st.error("Terjadi kesalahan: Jumlah label cluster tidak sesuai dengan jumlah data. Silakan jalankan ulang eksperimen.")
+
+# --- TAB 3: INTERPRETASI & DOWNLOAD ---
 with tab3:
-    st.write("Dibuat untuk demonstrasi analisis data kesehatan smartwatch.")
+    # Cek apakah 'Cluster' sudah ada di df (artinya eksperimen sudah dijalankan)
+    if 'Cluster' in df.columns:
+        st.header("💡 Interpretasi Hasil")
+        
+        # 1. Profiling Rata-rata Cluster
+        st.subheader("Rata-rata Fitur per Cluster")
+        # Hitung rata-rata per cluster
+        cluster_means = df.groupby('Cluster')[features].mean()
+        # Tampilkan dengan gradasi warna untuk memudahkan melihat nilai tinggi/rendah
+        st.dataframe(cluster_means.style.background_gradient(cmap='Blues'))
+
+        # 2. Box Plot Interaktif
+        st.subheader("Distribusi Fitur Antar Cluster")
+        selected_feature = st.selectbox("Pilih Fitur untuk Dianalisis:", features)
+        
+        fig_box, ax_box = plt.subplots(figsize=(8, 4))
+        sns.boxplot(x='Cluster', y=selected_feature, data=df, palette='viridis', ax=ax_box)
+        ax_box.set_title(f"Distribusi {selected_feature} per Cluster")
+        st.pyplot(fig_box)
+
+        # 3. Download Data Hasil
+        st.subheader("📥 Download Hasil")
+        # Konversi dataframe ke CSV untuk didownload
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Data dengan Label Cluster (CSV)",
+            data=csv,
+            file_name=f'smartwatch_clustering_results_K{st.session_state["best_k"]}.csv',
+            mime='text/csv',
+        )
+    else:
+        st.info("⚠️ Silakan jalankan eksperimen di Tab 2 terlebih dahulu untuk melihat interpretasi.")
